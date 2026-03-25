@@ -129,7 +129,7 @@ class Hyperparameters:
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "sgd")  # "sgd" or "adamw"
     ttt_lr = float(os.environ.get("TTT_LR", 1.0))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 20))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 8))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))

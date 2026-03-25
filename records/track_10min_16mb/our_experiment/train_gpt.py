@@ -115,8 +115,8 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
-    late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
-    soft_round_qat = bool(int(os.environ.get("SOFT_ROUND_QAT", "0")))
+    late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
+    soft_round_qat = bool(int(os.environ.get("SOFT_ROUND_QAT", "1")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "1")))
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "1")))
     canon_last_n = int(os.environ.get("CANON_LAST_N", 0))
@@ -127,12 +127,12 @@ class Hyperparameters:
 
     # TTT (Test-Time Training) — score-first, backward-looking
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
-    ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "adamw")  # "sgd" or "adamw"
-    ttt_lr = float(os.environ.get("TTT_LR", 0.0001))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 4))
+    ttt_optimizer = os.environ.get("TTT_OPTIMIZER", "sgd")  # "sgd" or "adamw"
+    ttt_lr = float(os.environ.get("TTT_LR", 1.0))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 20))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
-    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 131072))
 
 # -----------------------------
@@ -572,7 +572,7 @@ class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
     _soft_round: bool = False
     _soft_round_alpha: float = 1.0
-    _quant_percentile: float = float(os.environ.get("QUANT_PERCENTILE", "1.0"))
+    _quant_percentile: float = float(os.environ.get("QUANT_PERCENTILE", "0.9999"))
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
@@ -1743,7 +1743,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        qat_threshold = float(os.environ.get("QAT_THRESHOLD", "0.1"))
+        qat_threshold = float(os.environ.get("QAT_THRESHOLD", "0.5"))
         if args.late_qat and scale < qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             CastedLinear._soft_round = args.soft_round_qat

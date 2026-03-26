@@ -1243,11 +1243,12 @@ def eval_val_sliding(
                 chunk_windows = [ws for ws in window_starts if cs <= ws < ce]
                 my_chunk_windows = chunk_windows[rank::world_size]
 
-                _score_windows(my_chunk_windows, apply_ngram=True)
+                _score_windows(my_chunk_windows, apply_ngram=use_ngram)
 
                 # ALL GPUs update cache from full chunk (deterministic, no NCCL)
-                _bulk_cache_update(val_np, cs + 1, ce, ctx_tables, full_tables,
-                                   ng_primes, ng_mask, ngram_min_order, _n_orders)
+                if use_ngram:
+                    _bulk_cache_update(val_np, cs + 1, ce, ctx_tables, full_tables,
+                                       ng_primes, ng_mask, ngram_min_order, _n_orders)
 
                 # Upfront timing go/no-go after 2 chunks
                 if ci == 1:
@@ -1260,15 +1261,6 @@ def eval_val_sliding(
 
                 if ci % 4 == 3 or ci == n_chunks - 1:
                     print(f"ngram_chunk: {ci+1}/{n_chunks} elapsed={time.perf_counter()-eval_t0:.1f}s", flush=True)
-
-            # Score remaining chunks without ngram if aborted
-            if not use_ngram:
-                for ci2 in range(ci + 1, n_chunks):
-                    cs2 = chunk_starts_list[ci2]
-                    ce2 = min(cs2 + ngram_chunk_size, total_tokens)
-                    chunk_windows = [ws for ws in window_starts if cs2 <= ws < ce2]
-                    my_chunk_windows = chunk_windows[rank::world_size]
-                    _score_windows(my_chunk_windows, apply_ngram=False)
 
             # Final all-reduce after all chunks (avoids double-counting)
             if distributed:

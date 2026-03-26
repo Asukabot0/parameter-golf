@@ -928,7 +928,6 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
-        self._last_hidden: Tensor | None = None  # cached for gate training
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -977,7 +976,6 @@ class GPT(nn.Module):
             x, _ = self.blocks[self.num_encoder_layers + i](x, x0, v0=v0)
 
         x = self.final_norm(x)
-        self._last_hidden = x.detach()  # cache for gate training (no second forward)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -1957,14 +1955,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # When gate is enabled, skip torch.compile — _last_hidden in forward() is a side
-    # effect incompatible with fullgraph=True, and fullgraph=False causes recompilation.
-    # Eager single forward (~1200ms) beats compiled+uncompiled double forward (~4500ms).
-    _gate_enabled = bool(int(os.environ.get("GATE_ENABLED", "0")))
-    if _gate_enabled:
-        compiled_model = base_model
-    else:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # Also compile forward_logits_with_hidden for gate training (no side effects, fullgraph OK)
+    _compiled_logits_hidden = torch.compile(base_model.forward_logits_with_hidden, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, static_graph=True) if distributed else compiled_model
 
     # Optimizer split:
@@ -2223,13 +2216,7 @@ def main() -> None:
                 # Gate loss: route between neural + n-gram oracle + kNN
                 if use_gate and gate_head is not None and gate_oracle is not None:
                     with torch.no_grad():
-                        hidden_g = base_model._last_hidden  # (B, T, dim) cached in forward()
-                        # Cheap logit projection instead of full second forward pass
-                        if base_model.tie_embeddings:
-                            logits_g = F.linear(hidden_g, base_model.tok_emb.weight)
-                        else:
-                            logits_g = base_model.lm_head(hidden_g)
-                        logits_g = base_model.logit_softcap * torch.tanh(logits_g / base_model.logit_softcap)
+                        logits_g, hidden_g = _compiled_logits_hidden(x)
                         neural_lp = F.log_softmax(logits_g.float(), dim=-1)  # (B, T, V)
                     B, T, V = neural_lp.shape
                     flat_y = y.reshape(-1)  # (B*T,)

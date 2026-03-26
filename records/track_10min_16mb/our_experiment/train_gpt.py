@@ -1091,12 +1091,12 @@ def eval_val_sliding(
     use_ngram = bool(int(os.environ.get("NGRAM_CACHE", _ngram_default)))
     ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.40"))
     ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", "2"))
-    ngram_order = int(os.environ.get("NGRAM_ORDER", "7"))
+    ngram_order = int(os.environ.get("NGRAM_ORDER", "28"))
     ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", "2"))
     ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", "4194304"))
     ngram_entropy = bool(int(os.environ.get("NGRAM_ENTROPY", "1")))
-    ngram_ent_base = float(os.environ.get("NGRAM_ENT_BASE", "0.05"))
-    ngram_ent_range = float(os.environ.get("NGRAM_ENT_RANGE", "0.55"))
+    ngram_ent_base = float(os.environ.get("NGRAM_ENT_BASE", "0.10"))
+    ngram_ent_range = float(os.environ.get("NGRAM_ENT_RANGE", "0.80"))
     ngram_ent_scale = float(os.environ.get("NGRAM_ENT_SCALE", "2.0"))
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", "4.0"))
     ngram_per_order_ent = bool(int(os.environ.get("NGRAM_PER_ORDER_ENT", "1")))
@@ -1109,10 +1109,23 @@ def eval_val_sliding(
         ng_mask = np.uint64(ngram_buckets - 1)
         ng_primes = np.array(
             [np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929),
-             np.uint64(131071), np.uint64(175447), np.uint64(209591)],
+             np.uint64(131071), np.uint64(175447), np.uint64(209591), np.uint64(262147),
+             np.uint64(314159), np.uint64(393241), np.uint64(458753), np.uint64(524309),
+             np.uint64(611957), np.uint64(746773), np.uint64(851969), np.uint64(917503),
+             np.uint64(1048583), np.uint64(1153433), np.uint64(1258291), np.uint64(1398269),
+             np.uint64(1523651), np.uint64(1636007), np.uint64(1741823), np.uint64(1867559),
+             np.uint64(1987141), np.uint64(2097169), np.uint64(2228243), np.uint64(2359297),
+             np.uint64(2490377)],
             dtype=np.uint64,
         )
-        per_order_centers = {7: 3.0, 6: 3.2, 5: 3.5, 4: 3.8, 3: 4.2, 2: 4.5}
+        per_order_centers = {
+            28: 1.0, 27: 1.1, 26: 1.2, 25: 1.3, 24: 1.4,
+            23: 1.5, 22: 1.6, 21: 1.7, 20: 1.8, 19: 1.9,
+            18: 2.0, 17: 2.1, 16: 2.2, 15: 2.3, 14: 2.4,
+            13: 2.5, 12: 2.6, 11: 2.7, 10: 2.8, 9: 2.9,
+            8: 3.1, 7: 3.3, 6: 3.5, 5: 3.7, 4: 3.9,
+            3: 4.1, 2: 4.5,
+        }
         print(f"ngram_cache:enabled orders={ngram_min_order}-{ngram_order} backoff "
               f"chunk_sync chunk_size={ngram_chunk_size} "
               f"entropy={ngram_entropy} per_order_ent={ngram_per_order_ent} "

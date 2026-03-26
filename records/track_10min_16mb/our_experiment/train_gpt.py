@@ -1062,53 +1062,116 @@ class GPT(nn.Module):
 
 
 class KNNDatastore:
-    """GPU-resident kNN datastore for hidden state similarity search."""
+    """GPU-resident kNN datastore using FAISS IVF for fast approximate search.
+    Falls back to exact brute-force search if FAISS is unavailable or datastore is small."""
 
-    def __init__(self, dim: int, max_tokens: int, device: torch.device):
-        self.keys = torch.zeros(max_tokens, dim, dtype=torch.float16, device=device)
-        self.vals = torch.zeros(max_tokens, dtype=torch.int32, device=device)
-        self.size = 0
+    def __init__(self, dim: int, max_tokens: int, device: torch.device,
+                 nlist: int = 256, nprobe: int = 32, rebuild_every: int = 100000):
         self.dim = dim
+        self.max_tokens = max_tokens
+        self.device = device
+        self.nlist = nlist
+        self.nprobe = nprobe
+        self.rebuild_every = rebuild_every
+        # CPU storage for FAISS
+        self.keys_cpu = np.zeros((max_tokens, dim), dtype=np.float32)
+        self.vals_cpu = np.zeros(max_tokens, dtype=np.int32)
+        self.size = 0
+        self._last_index_size = 0
+        self._index = None
+        # Try to import FAISS
+        try:
+            import faiss
+            self._faiss = faiss
+            self._gpu_res = faiss.StandardGpuResources()
+            self._gpu_res.setTempMemory(256 * 1024 * 1024)  # 256MB temp
+            print(f"knn_datastore: FAISS GPU available, nlist={nlist} nprobe={nprobe}", flush=True)
+        except ImportError:
+            self._faiss = None
+            self._gpu_res = None
+            print("knn_datastore: FAISS not available, using exact search (SLOW)", flush=True)
 
     def add(self, hidden: Tensor, targets: Tensor) -> None:
-        """Add (hidden_state, target_token) pairs. hidden: (N, dim), targets: (N,)."""
+        """Add (hidden_state, target_token) pairs."""
         n = hidden.shape[0]
-        space = self.keys.shape[0] - self.size
+        space = self.max_tokens - self.size
         if space <= 0:
             return
         actual = min(n, space)
-        self.keys[self.size:self.size + actual] = hidden[:actual].half()
-        self.vals[self.size:self.size + actual] = targets[:actual].int()
+        h_np = F.normalize(hidden[:actual].float(), dim=-1).cpu().numpy()
+        self.keys_cpu[self.size:self.size + actual] = h_np
+        self.vals_cpu[self.size:self.size + actual] = targets[:actual].cpu().numpy().astype(np.int32)
         self.size += actual
+
+    def _rebuild_index(self) -> None:
+        """Rebuild FAISS GPU index from current data."""
+        if self._faiss is None or self.size < self.nlist * 2:
+            return
+        faiss = self._faiss
+        # Build IVF-Flat on CPU then move to GPU
+        quantizer = faiss.IndexFlatIP(self.dim)
+        index_cpu = faiss.IndexIVFFlat(quantizer, self.dim, min(self.nlist, self.size // 2),
+                                        faiss.METRIC_INNER_PRODUCT)
+        data = self.keys_cpu[:self.size]
+        index_cpu.train(data)
+        index_cpu.add(data)
+        # Move to GPU
+        self._index = faiss.index_cpu_to_gpu(self._gpu_res, self.device.index or 0, index_cpu)
+        self._index.nprobe = self.nprobe
+        self._last_index_size = self.size
 
     def query(self, queries: Tensor, k: int = 32, temperature: float = 10.0
               ) -> tuple[Tensor, Tensor] | None:
-        """Query k nearest neighbors. Returns (knn_probs, knn_dists) or None.
-        knn_probs: (Q, vocab) probability distribution from neighbors.
-        knn_dists: (Q,) mean distance to top-k neighbors."""
-        if self.size < k:
+        """Query k nearest neighbors using FAISS GPU IVF.
+        Returns (knn_probs, knn_dists) or None."""
+        if self.size < k * 2:
             return None
-        # Normalize for cosine similarity
-        q_norm = F.normalize(queries.float(), dim=-1)          # (Q, dim)
-        k_norm = F.normalize(self.keys[:self.size].float(), dim=-1)  # (S, dim)
-        # Batched matmul — process in chunks to limit memory
+
+        # Rebuild index periodically
+        if self._faiss is not None and (self._index is None or
+                self.size - self._last_index_size >= self.rebuild_every):
+            self._rebuild_index()
+
+        q_np = F.normalize(queries.float(), dim=-1).cpu().numpy()
         Q = queries.shape[0]
-        vocab_size = 1024  # hardcoded for this competition
-        all_probs = torch.zeros(Q, vocab_size, device=queries.device)
-        all_dists = torch.zeros(Q, device=queries.device)
-        batch = 256  # process 256 queries at a time
-        for qi in range(0, Q, batch):
-            qe = min(qi + batch, Q)
-            sim = q_norm[qi:qe] @ k_norm.T                    # (batch, S)
-            topk_sim, topk_idx = sim.topk(k, dim=-1)          # (batch, k)
-            topk_tokens = self.vals[topk_idx]                  # (batch, k)
-            # Softmax-weighted probability from neighbors
-            weights = F.softmax(topk_sim * temperature, dim=-1)  # (batch, k)
-            # Scatter into vocab distribution
-            probs = torch.zeros(qe - qi, vocab_size, device=queries.device)
-            probs.scatter_add_(1, topk_tokens.long(), weights)
-            all_probs[qi:qe] = probs
-            all_dists[qi:qe] = topk_sim.mean(dim=-1)
+        vocab_size = 1024
+
+        if self._index is not None:
+            # FAISS GPU search (fast!)
+            sims, indices = self._index.search(q_np, k)  # (Q, k) each
+            sims = torch.from_numpy(sims).to(self.device)
+            indices = torch.from_numpy(indices.astype(np.int64)).to(self.device)
+            # Handle -1 indices (not enough results)
+            valid_mask = indices >= 0
+            indices = indices.clamp(min=0)
+            topk_tokens = torch.from_numpy(self.vals_cpu[indices.cpu().numpy()]).to(self.device)
+        else:
+            # Exact brute-force fallback (slow, for small datastores or no FAISS)
+            k_data = torch.from_numpy(self.keys_cpu[:self.size]).to(self.device)
+            batch = 512
+            sims_list, idx_list = [], []
+            for qi in range(0, Q, batch):
+                qe = min(qi + batch, Q)
+                q_batch = torch.from_numpy(q_np[qi:qe]).to(self.device)
+                sim = q_batch @ k_data.T
+                topk_sim, topk_idx = sim.topk(k, dim=-1)
+                sims_list.append(topk_sim)
+                idx_list.append(topk_idx)
+            sims = torch.cat(sims_list, dim=0)
+            indices = torch.cat(idx_list, dim=0)
+            valid_mask = torch.ones_like(indices, dtype=torch.bool)
+            topk_tokens = torch.from_numpy(self.vals_cpu[indices.cpu().numpy()]).to(self.device)
+
+        # Softmax-weighted probability from neighbors
+        sims = sims.clamp(min=-1, max=1)
+        weights = F.softmax(sims * temperature, dim=-1)
+        weights = weights * valid_mask.float()
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # Scatter into vocab distribution
+        all_probs = torch.zeros(Q, vocab_size, device=self.device)
+        all_probs.scatter_add_(1, topk_tokens.long(), weights)
+        all_dists = sims.mean(dim=-1)
         return all_probs, all_dists
 
 

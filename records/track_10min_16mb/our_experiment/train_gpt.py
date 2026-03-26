@@ -1037,6 +1037,27 @@ class GPT(nn.Module):
 # SLIDING WINDOW EVALUATION
 # -----------------------------
 
+def _bulk_cache_update(val_np, start, end, ctx_tables, full_tables,
+                       ng_primes, ng_mask, ngram_min_order, _n_orders):
+    """Vectorized cache update for a contiguous token range [start, end).
+    Uses np.bincount for fast scatter-add (replaces slow np.add.at)."""
+    for oi in range(_n_orders):
+        ctx_w = ngram_min_order + oi - 1
+        first_pos = max(start, ctx_w + 1)
+        if first_pos >= end:
+            continue
+        positions = np.arange(first_pos, end, dtype=np.int64)
+        ctx_hash = np.zeros(len(positions), dtype=np.uint64)
+        for k in range(ctx_w):
+            tok = val_np[positions - ctx_w + k].astype(np.uint64)
+            ctx_hash ^= tok * ng_primes[k % len(ng_primes)]
+        ctx_key = (ctx_hash & ng_mask).astype(np.int64)
+        tgt = val_np[positions].astype(np.uint64)
+        full_key = ((ctx_hash ^ (tgt * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
+        ctx_tables[oi] += np.bincount(ctx_key, minlength=len(ctx_tables[oi])).astype(np.uint32)
+        full_tables[oi] += np.bincount(full_key, minlength=len(full_tables[oi])).astype(np.uint32)
+
+
 def eval_val_sliding(
     args: Hyperparameters,
     base_model: nn.Module,
@@ -1060,15 +1081,12 @@ def eval_val_sliding(
                      if min(ws + seq_len, total_tokens) - ws >= 1]
     total_windows = len(window_starts)
 
-    my_s = (total_windows * rank) // world_size
-    my_e = (total_windows * (rank + 1)) // world_size
-    my_windows = window_starts[my_s:my_e]
-
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    distributed = dist.is_available() and dist.is_initialized()
 
-    # N-gram eval cache with multi-order backoff + entropy-adaptive alpha (PR #702 inspired)
+    # N-gram eval cache with multi-order backoff + entropy-adaptive alpha + chunk-level GPU sync
     _ngram_default = "1" if world_size > 1 else "0"
     use_ngram = bool(int(os.environ.get("NGRAM_CACHE", _ngram_default)))
     ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.40"))
@@ -1081,6 +1099,8 @@ def eval_val_sliding(
     ngram_ent_range = float(os.environ.get("NGRAM_ENT_RANGE", "0.55"))
     ngram_ent_scale = float(os.environ.get("NGRAM_ENT_SCALE", "2.0"))
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", "4.0"))
+    ngram_per_order_ent = bool(int(os.environ.get("NGRAM_PER_ORDER_ENT", "1")))
+    ngram_chunk_size = int(os.environ.get("NGRAM_CHUNK_SIZE", "4000000"))
     if use_ngram:
         val_np = val_tokens.cpu().numpy()
         _n_orders = ngram_order - ngram_min_order + 1
@@ -1092,23 +1112,25 @@ def eval_val_sliding(
              np.uint64(131071), np.uint64(175447), np.uint64(209591)],
             dtype=np.uint64,
         )
+        per_order_centers = {7: 3.0, 6: 3.2, 5: 3.5, 4: 3.8, 3: 4.2, 2: 4.5}
         print(f"ngram_cache:enabled orders={ngram_min_order}-{ngram_order} backoff "
-              f"entropy={ngram_entropy} alpha={ngram_alpha} "
+              f"chunk_sync chunk_size={ngram_chunk_size} "
+              f"entropy={ngram_entropy} per_order_ent={ngram_per_order_ent} "
               f"ent_base={ngram_ent_base} ent_range={ngram_ent_range} "
               f"min_count={ngram_min_count} buckets={ngram_buckets}", flush=True)
 
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
 
-    with torch.inference_mode():
-        for bi in range(0, len(my_windows), batch_seqs):
-            batch_ws = my_windows[bi:bi + batch_seqs]
+    # --- Inner scoring function (shared by both paths) ---
+    def _score_windows(my_wins, apply_ngram):
+        for bi in range(0, len(my_wins), batch_seqs):
+            batch_ws = my_wins[bi:bi + batch_seqs]
             bsz = len(batch_ws)
-
-            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            # Pad to batch_seqs for torch.compile shape stability
+            x_batch = torch.zeros(batch_seqs, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(batch_seqs, seq_len, dtype=torch.int64, device=device)
             wlens: list[int] = []
-
             for i, ws in enumerate(batch_ws):
                 end = min(ws + seq_len, total_tokens)
                 wlen = end - ws
@@ -1124,7 +1146,7 @@ def eval_val_sliding(
                 logits.reshape(-1, logits.size(-1)).float(),
                 y_batch.reshape(-1),
                 reduction="none",
-            ).reshape(bsz, seq_len)
+            ).reshape(batch_seqs, seq_len)
 
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
@@ -1132,25 +1154,21 @@ def eval_val_sliding(
                 seg_len = wlen - s
                 if seg_len <= 0:
                     continue
-
                 scored_nll = nll[i, s:wlen].to(torch.float64)
 
-                if use_ngram:
+                if apply_ngram:
                     seg_nll_np = scored_nll.cpu().numpy()
                     seg_model_p = np.exp(-seg_nll_np)
                     n_seg = len(seg_nll_np)
                     global_j = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
 
-                    # Entropy-adaptive alpha: compute from model logits (GPU)
                     if ngram_entropy:
                         with torch.no_grad():
                             lp = F.log_softmax(logits[i, s:wlen].float(), dim=-1)
                             seg_ent = -(lp.exp() * lp).sum(dim=-1).cpu().numpy()
-                        alpha_per_tok = ngram_ent_base + ngram_ent_range / (
-                            1.0 + np.exp(-ngram_ent_scale * (seg_ent - ngram_ent_thresh)))
 
                     # Precompute hashes for all orders
-                    order_data = []  # (v_idx, ctx_key, full_key) per order
+                    order_data = []
                     for oi in range(_n_orders):
                         ctx_w = ngram_min_order + oi - 1
                         valid = global_j >= ctx_w
@@ -1168,8 +1186,9 @@ def eval_val_sliding(
                         full_key = ((ctx_hash ^ (tgt_np * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
                         order_data.append((v_idx, ctx_key, full_key))
 
-                    # Multi-order backoff: highest order first, fill unmatched with lower orders
+                    # Multi-order backoff
                     best_p_ng = np.full(n_seg, -1.0)
+                    best_order = np.full(n_seg, -1, dtype=np.int32)
                     for oi in range(_n_orders - 1, -1, -1):
                         if order_data[oi] is None:
                             continue
@@ -1182,39 +1201,90 @@ def eval_val_sliding(
                             fill_idx = v_idx[needs_fill]
                             p = np.minimum(full_counts[needs_fill], ctx_counts[needs_fill]) / np.maximum(ctx_counts[needs_fill], 1.0)
                             best_p_ng[fill_idx] = np.clip(p, 0.0, 1.0)
+                            best_order[fill_idx] = ngram_min_order + oi
 
                     # Mix model probability with n-gram
                     has_match = best_p_ng >= 0
                     if has_match.any():
                         if ngram_entropy:
-                            alpha = alpha_per_tok[has_match]
+                            if ngram_per_order_ent:
+                                matched_centers = np.array([per_order_centers.get(o, ngram_ent_thresh) for o in best_order[has_match]])
+                                alpha = ngram_ent_base + ngram_ent_range / (
+                                    1.0 + np.exp(-ngram_ent_scale * (seg_ent[has_match] - matched_centers)))
+                            else:
+                                alpha_all = ngram_ent_base + ngram_ent_range / (
+                                    1.0 + np.exp(-ngram_ent_scale * (seg_ent - ngram_ent_thresh)))
+                                alpha = alpha_all[has_match]
                         else:
                             alpha = ngram_alpha
                         seg_model_p[has_match] = (1.0 - alpha) * seg_model_p[has_match] + alpha * best_p_ng[has_match]
                     seg_nll_np = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
-
-                    # Score-first: update ALL order tables AFTER scoring
-                    for oi in range(_n_orders):
-                        if order_data[oi] is None:
-                            continue
-                        v_idx, ctx_key, full_key = order_data[oi]
-                        np.add.at(ctx_tables[oi], ctx_key, 1)
-                        np.add.at(full_tables[oi], full_key, 1)
-
                     scored_nll = torch.from_numpy(seg_nll_np).to(dtype=torch.float64, device=device)
 
-                loss_sum += scored_nll.sum()
-                token_count += float(seg_len)
+                loss_sum.add_(scored_nll.sum())
+                token_count.add_(float(seg_len))
                 tgt = y_batch[i, s:wlen]
                 prev = x_batch[i, s:wlen]
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count += tb.sum()
+                byte_count.add_(tb.sum())
 
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+    # --- Main eval: chunk-level sync (ngram) or per-GPU partition (no ngram) ---
+    with torch.inference_mode():
+        if use_ngram:
+            # Chunk-level iteration: all GPUs process all chunks, share cache
+            chunk_starts_list = list(range(0, total_tokens, ngram_chunk_size))
+            n_chunks = len(chunk_starts_list)
+            eval_t0 = time.perf_counter()
+            max_eval_s = float(os.environ.get("MAX_EVAL_SECONDS", "550"))
+
+            for ci, cs in enumerate(chunk_starts_list):
+                ce = min(cs + ngram_chunk_size, total_tokens)
+                chunk_windows = [ws for ws in window_starts if cs <= ws < ce]
+                my_chunk_windows = chunk_windows[rank::world_size]
+
+                _score_windows(my_chunk_windows, apply_ngram=True)
+
+                # ALL GPUs update cache from full chunk (deterministic, no NCCL)
+                _bulk_cache_update(val_np, cs + 1, ce, ctx_tables, full_tables,
+                                   ng_primes, ng_mask, ngram_min_order, _n_orders)
+
+                # Upfront timing go/no-go after 2 chunks
+                if ci == 1:
+                    elapsed = time.perf_counter() - eval_t0
+                    est_total = elapsed / 2.0 * n_chunks
+                    if est_total > max_eval_s:
+                        print(f"ngram_abort: est {est_total:.0f}s > {max_eval_s}s after {ci+1} chunks, "
+                              f"disabling cache for remaining {n_chunks-ci-1} chunks", flush=True)
+                        use_ngram = False
+
+                if ci % 4 == 3 or ci == n_chunks - 1:
+                    print(f"ngram_chunk: {ci+1}/{n_chunks} elapsed={time.perf_counter()-eval_t0:.1f}s", flush=True)
+
+            # Score remaining chunks without ngram if aborted
+            if not use_ngram:
+                for ci2 in range(ci + 1, n_chunks):
+                    cs2 = chunk_starts_list[ci2]
+                    ce2 = min(cs2 + ngram_chunk_size, total_tokens)
+                    chunk_windows = [ws for ws in window_starts if cs2 <= ws < ce2]
+                    my_chunk_windows = chunk_windows[rank::world_size]
+                    _score_windows(my_chunk_windows, apply_ngram=False)
+
+            # Final all-reduce after all chunks (avoids double-counting)
+            if distributed:
+                dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+                dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+        else:
+            # Original per-GPU partition (no ngram cache)
+            my_s = (total_windows * rank) // world_size
+            my_e = (total_windows * (rank + 1)) // world_size
+            my_windows = window_starts[my_s:my_e]
+            _score_windows(my_windows, apply_ngram=False)
+            if distributed:
+                dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+                dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
 
     val_loss = (loss_sum / token_count).item()
     bits_per_token = val_loss / math.log(2.0)

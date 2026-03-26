@@ -1083,12 +1083,23 @@ class KNNDatastore:
         try:
             import faiss
             self._faiss = faiss
-            self._gpu_res = faiss.StandardGpuResources()
-            self._gpu_res.setTempMemory(256 * 1024 * 1024)  # 256MB temp
-            print(f"knn_datastore: FAISS GPU available, nlist={nlist} nprobe={nprobe}", flush=True)
         except ImportError:
-            self._faiss = None
-            self._gpu_res = None
+            self._faiss = faiss = None
+        # Try GPU resources first, fall back to CPU-only FAISS
+        self._gpu_res = None
+        self._faiss_gpu = False
+        if faiss is not None and hasattr(faiss, 'StandardGpuResources'):
+            try:
+                self._gpu_res = faiss.StandardGpuResources()
+                self._gpu_res.setTempMemory(256 * 1024 * 1024)  # 256MB temp
+                self._faiss_gpu = True
+                print(f"knn_datastore: FAISS GPU available, nlist={nlist} nprobe={nprobe}", flush=True)
+            except Exception:
+                self._gpu_res = None
+                self._faiss_gpu = False
+        if faiss is not None and not self._faiss_gpu:
+            print(f"knn_datastore: FAISS CPU mode, nlist={nlist} nprobe={nprobe}", flush=True)
+        if faiss is None:
             print("knn_datastore: FAISS not available, using exact search (SLOW)", flush=True)
 
     def add(self, hidden: Tensor, targets: Tensor) -> None:
@@ -1115,8 +1126,10 @@ class KNNDatastore:
         data = self.keys_cpu[:self.size]
         index_cpu.train(data)
         index_cpu.add(data)
-        # Move to GPU
-        self._index = faiss.index_cpu_to_gpu(self._gpu_res, self.device.index or 0, index_cpu)
+        if self._faiss_gpu:
+            self._index = faiss.index_cpu_to_gpu(self._gpu_res, self.device.index or 0, index_cpu)
+        else:
+            self._index = index_cpu
         self._index.nprobe = self.nprobe
         self._last_index_size = self.size
 
@@ -1195,6 +1208,7 @@ class GpuNgramMixer:
 
     def update(self, token_ids: Tensor) -> None:
         """Bulk update cache from a contiguous token sequence. token_ids: (N,) int."""
+        token_ids = token_ids.long()
         N = token_ids.shape[0]
         for oi in range(self.n_orders):
             ctx_w = self.min_order + oi - 1
@@ -1217,6 +1231,7 @@ class GpuNgramMixer:
         """Query n-gram probabilities with backoff.
         token_ids: full val sequence (N,). positions: (Q,) positions to query.
         Returns: (best_p_ng, best_order) shape (Q,). -1 means no match."""
+        token_ids = token_ids.long()
         Q = positions.shape[0]
         best_p = torch.full((Q,), -1.0, device=self.device)
         best_ord = torch.full((Q,), -1, dtype=torch.int32, device=self.device)

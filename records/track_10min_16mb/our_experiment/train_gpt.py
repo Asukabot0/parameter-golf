@@ -1074,33 +1074,17 @@ class KNNDatastore:
         self.nprobe = nprobe
         self.rebuild_every = rebuild_every
         # GPU-resident storage (avoid CPU-GPU transfers on add/query)
-        self.keys_gpu = torch.zeros(max_tokens, dim, dtype=torch.float32, device=device)
+        self.keys_gpu = torch.zeros(max_tokens, dim, dtype=torch.float16, device=device)
         self.vals_gpu = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         self.size = 0
         self._last_index_size = 0
         self._index = None
-        # Try to import FAISS
-        try:
-            import faiss
-            self._faiss = faiss
-        except ImportError:
-            self._faiss = faiss = None
-        # Try GPU resources first, fall back to CPU-only FAISS
+        # FAISS disabled — GPU exact search (fp16 matmul+topk) is faster for our use case
+        # FAISS IVF has expensive rebuild cycles and CPU↔GPU bounce via numpy API
+        self._faiss = None
         self._gpu_res = None
         self._faiss_gpu = False
-        if faiss is not None and hasattr(faiss, 'StandardGpuResources'):
-            try:
-                self._gpu_res = faiss.StandardGpuResources()
-                self._gpu_res.setTempMemory(256 * 1024 * 1024)  # 256MB temp
-                self._faiss_gpu = True
-                print(f"knn_datastore: FAISS GPU available, nlist={nlist} nprobe={nprobe}", flush=True)
-            except Exception:
-                self._gpu_res = None
-                self._faiss_gpu = False
-        if faiss is not None and not self._faiss_gpu:
-            print(f"knn_datastore: FAISS CPU mode, nlist={nlist} nprobe={nprobe}", flush=True)
-        if faiss is None:
-            print("knn_datastore: FAISS not available, using exact search (SLOW)", flush=True)
+        print(f"knn_datastore: GPU exact search (fp16), max_tokens={max_tokens}", flush=True)
 
     def add(self, hidden: Tensor, targets: Tensor) -> None:
         """Add (hidden_state, target_token) pairs. Stays on GPU — no CPU sync."""
@@ -1109,7 +1093,7 @@ class KNNDatastore:
         if space <= 0:
             return
         actual = min(n, space)
-        self.keys_gpu[self.size:self.size + actual] = F.normalize(hidden[:actual].float(), dim=-1)
+        self.keys_gpu[self.size:self.size + actual] = F.normalize(hidden[:actual].float(), dim=-1).half()
         self.vals_gpu[self.size:self.size + actual] = targets[:actual].int()
         self.size += actual
 
@@ -1144,13 +1128,13 @@ class KNNDatastore:
                 self.size - self._last_index_size >= self.rebuild_every):
             self._rebuild_index()
 
-        q_norm = F.normalize(queries.float(), dim=-1)
+        q_norm = F.normalize(queries.float(), dim=-1).half()
         Q = queries.shape[0]
         vocab_size = 1024
 
         if self._index is not None:
             # FAISS search (needs CPU numpy for API)
-            q_np = q_norm.cpu().numpy()
+            q_np = q_norm.float().cpu().numpy()
             sims_np, indices_np = self._index.search(q_np, k)  # (Q, k) each
             sims = torch.from_numpy(sims_np).to(self.device)
             indices = torch.from_numpy(indices_np.astype(np.int64)).to(self.device)
@@ -1158,13 +1142,13 @@ class KNNDatastore:
             indices = indices.clamp(min=0)
             topk_tokens = self.vals_gpu[indices]  # direct GPU indexing, no round-trip
         else:
-            # Exact brute-force fallback on GPU (no CPU transfer)
+            # Exact brute-force on GPU (fp16 matmul + topk, no CPU transfer)
             k_data = self.keys_gpu[:self.size]
-            batch = 512
+            batch = 4096
             sims_list, idx_list = [], []
             for qi in range(0, Q, batch):
                 qe = min(qi + batch, Q)
-                sim = q_norm[qi:qe] @ k_data.T
+                sim = (q_norm[qi:qe] @ k_data.T).float()
                 topk_sim, topk_idx = sim.topk(k, dim=-1)
                 sims_list.append(topk_sim)
                 idx_list.append(topk_idx)
@@ -1352,6 +1336,7 @@ def eval_val_sliding(
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
     eval_gate_head: GateHead | None = None,
+    eval_gate_oracle: 'GpuNgramMixer | None' = None,
 ) -> tuple[float, float]:
     """Sliding window evaluation: each token scored with maximum context.
     Optionally uses entropy-gated 5-gram cache (NGRAM_CACHE=1)."""
@@ -1425,7 +1410,7 @@ def eval_val_sliding(
               f"min_count={ngram_min_count} buckets={ngram_buckets}", flush=True)
 
     base_model.eval()
-    if use_knn:
+    if use_knn or eval_gate_head is not None:
         compiled_logits_hidden = torch.compile(base_model.forward_logits_with_hidden, dynamic=False, fullgraph=True)
     else:
         compiled_logits_hidden = None
@@ -1449,7 +1434,8 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                if use_knn and knn_store is not None:
+                need_hidden = (use_knn and knn_store is not None) or (eval_gate_head is not None)
+                if need_hidden and compiled_logits_hidden is not None:
                     logits, hidden_states = compiled_logits_hidden(x_batch)
                 else:
                     logits = compiled_logits(x_batch)
@@ -1469,7 +1455,53 @@ def eval_val_sliding(
                     continue
                 scored_nll = nll[i, s:wlen].to(torch.float64)
 
-                if apply_ngram:
+                # Pure gate mode: gate handles neural + n-gram + kNN, skip independent n-gram cache
+                if eval_gate_head is not None and hidden_states is not None and use_knn and knn_store is not None:
+                    seg_hidden = hidden_states[i, s:wlen]  # (seg_len, dim)
+                    seg_targets = y_batch[i, s:wlen]       # (seg_len,)
+                    seg_nll_np = scored_nll.cpu().numpy()
+                    seg_model_p = np.exp(-seg_nll_np)  # neural prob
+                    n_seg = len(seg_nll_np)
+
+                    with torch.no_grad():
+                        gate_w = eval_gate_head(seg_hidden.float())  # (seg_len, n_experts)
+                    gw_np = gate_w.cpu().numpy().astype(np.float64)
+                    n_exp = gw_np.shape[1]
+
+                    # Query n-gram oracle for each order (same as training)
+                    # Use full sequence x[0:wlen] so n-gram has context before the scoring window
+                    seg_x = x_batch[i, :wlen].reshape(-1)
+                    seg_positions = torch.arange(s, wlen, device=device)
+                    ngram_p_per_order = []
+                    for oi in range(min(n_exp - 2, 6)):  # experts 1..6 = n-gram orders
+                        p_ng = eval_gate_oracle.query_order(seg_x, seg_positions, oi, min_count=2)
+                        ngram_p_per_order.append(p_ng.cpu().numpy().astype(np.float64))
+
+                    # Query kNN (last expert)
+                    knn_p = np.zeros(n_seg, dtype=np.float64)
+                    knn_result = knn_store.query(seg_hidden, k=knn_k, temperature=knn_temp)
+                    if knn_result is not None:
+                        knn_probs, _ = knn_result
+                        knn_p = knn_probs.gather(1, seg_targets.long().unsqueeze(1)).squeeze(1).cpu().numpy().astype(np.float64)
+
+                    # Weighted mix using gate weights
+                    mixed_p = gw_np[:, 0] * seg_model_p  # neural
+                    for oi in range(len(ngram_p_per_order)):
+                        p_ng = ngram_p_per_order[oi]
+                        valid = p_ng > 0
+                        # For invalid positions, redistribute weight to neural
+                        contrib = np.where(valid, gw_np[:, 1 + oi] * p_ng, 0.0)
+                        mixed_p += contrib
+                    mixed_p += gw_np[:, -1] * knn_p  # kNN expert
+
+                    # Normalize (gate weights sum to 1 but some experts may be inactive)
+                    mixed_p = np.clip(mixed_p, 1e-12, 1.0)
+                    scored_nll = torch.from_numpy(-np.log(mixed_p)).to(dtype=torch.float64, device=device)
+
+                    # Add to kNN datastore AFTER scoring
+                    knn_store.add(seg_hidden.detach(), seg_targets)
+
+                elif apply_ngram:
                     seg_nll_np = scored_nll.cpu().numpy()
                     seg_model_p = np.exp(-seg_nll_np)
                     n_seg = len(seg_nll_np)
@@ -1520,20 +1552,37 @@ def eval_val_sliding(
                     has_match = best_p_ng >= 0
                     if has_match.any():
                         if eval_gate_head is not None and hidden_states is not None:
-                            # Learned gate routing (PR #834 style)
+                            # Learned gate routing: unified mix of neural + n-gram + kNN
                             seg_hidden = hidden_states[i, s:wlen]  # (seg_len, dim)
+                            seg_targets = y_batch[i, s:wlen]       # (seg_len,)
                             with torch.no_grad():
                                 gate_w = eval_gate_head(seg_hidden)  # (seg_len, n_experts)
                             gw_np = gate_w.cpu().numpy().astype(np.float64)
-                            # Expert 0 = neural, experts 1+ = n-gram orders
+                            n_exp = gw_np.shape[1]
+                            # Expert 0 = neural
                             neural_w = gw_np[has_match, 0]
-                            # Use best matching order's weight
-                            order_indices = best_order[has_match] - ngram_min_order + 1  # map to expert idx
-                            order_indices = np.clip(order_indices, 0, gw_np.shape[1] - 1)
+                            # Best matching n-gram order's weight
+                            order_indices = best_order[has_match] - ngram_min_order + 1
+                            order_indices = np.clip(order_indices, 0, n_exp - 1)
                             ngram_w = np.array([gw_np[j, oidx] for j, oidx in zip(np.where(has_match)[0], order_indices)])
-                            # Normalize to sum to 1
-                            total_w = neural_w + ngram_w
-                            alpha = ngram_w / np.maximum(total_w, 1e-8)
+                            # kNN expert (last expert) if gate has it and kNN store available
+                            knn_w = np.zeros_like(neural_w)
+                            knn_p_matched = np.zeros_like(neural_w)
+                            if use_knn and knn_store is not None:
+                                knn_result = knn_store.query(seg_hidden, k=knn_k, temperature=knn_temp)
+                                if knn_result is not None:
+                                    knn_probs, _ = knn_result
+                                    knn_p_target = knn_probs.gather(1, seg_targets.long().unsqueeze(1)).squeeze(1)
+                                    knn_p_all = knn_p_target.cpu().numpy().astype(np.float64)
+                                    knn_p_matched = knn_p_all[has_match]
+                                    knn_w = gw_np[has_match, -1]  # last expert = kNN
+                            # Weighted mix: p = w_neural * p_neural + w_ngram * p_ngram + w_knn * p_knn
+                            total_w = neural_w + ngram_w + knn_w
+                            total_w = np.maximum(total_w, 1e-8)
+                            p_mixed = (neural_w / total_w) * seg_model_p[has_match] \
+                                    + (ngram_w / total_w) * best_p_ng[has_match] \
+                                    + (knn_w / total_w) * knn_p_matched
+                            seg_model_p[has_match] = np.clip(p_mixed, 1e-12, 1.0)
                         elif ngram_entropy:
                             if ngram_per_order_ent:
                                 matched_centers = np.array([per_order_centers.get(o, ngram_ent_thresh) for o in best_order[has_match]])
@@ -1543,29 +1592,32 @@ def eval_val_sliding(
                                 alpha_all = ngram_ent_base + ngram_ent_range / (
                                     1.0 + np.exp(-ngram_ent_scale * (seg_ent - ngram_ent_thresh)))
                                 alpha = alpha_all[has_match]
+                            seg_model_p[has_match] = (1.0 - alpha) * seg_model_p[has_match] + alpha * best_p_ng[has_match]
                         else:
                             alpha = ngram_alpha
-                        seg_model_p[has_match] = (1.0 - alpha) * seg_model_p[has_match] + alpha * best_p_ng[has_match]
+                            seg_model_p[has_match] = (1.0 - alpha) * seg_model_p[has_match] + alpha * best_p_ng[has_match]
                     seg_nll_np = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
                     scored_nll = torch.from_numpy(seg_nll_np).to(dtype=torch.float64, device=device)
 
-                # kNN-LM complement: query hidden state neighbors, blend probability
-                if use_knn and knn_store is not None and hidden_states is not None:
-                    seg_hidden = hidden_states[i, s:wlen]  # (seg_len, dim)
-                    seg_targets = y_batch[i, s:wlen]       # (seg_len,)
+                # kNN-LM complement: only when NOT using gate (gate handles kNN above)
+                if use_knn and knn_store is not None and hidden_states is not None and eval_gate_head is None:
+                    seg_hidden = hidden_states[i, s:wlen]
+                    seg_targets = y_batch[i, s:wlen]
                     knn_result = knn_store.query(seg_hidden, k=knn_k, temperature=knn_temp)
                     if knn_result is not None:
-                        knn_probs, knn_dists = knn_result  # (seg_len, vocab), (seg_len,)
-                        # Extract kNN probability for true target token
-                        knn_p_target = knn_probs.gather(1, seg_targets.long().unsqueeze(1)).squeeze(1)  # (seg_len,)
+                        knn_probs, knn_dists = knn_result
+                        knn_p_target = knn_probs.gather(1, seg_targets.long().unsqueeze(1)).squeeze(1)
                         knn_p_np = knn_p_target.cpu().numpy().astype(np.float64)
-                        # Blend: p_final = (1-lambda)*p_current + lambda*p_knn
                         current_p = np.exp(-scored_nll.cpu().numpy())
                         blended = (1.0 - knn_lambda) * current_p + knn_lambda * knn_p_np
                         scored_nll = torch.from_numpy(
                             -np.log(np.clip(blended, 1e-12, 1.0))
                         ).to(dtype=torch.float64, device=device)
-                    # Score-first: add to datastore AFTER scoring
+
+                # Add to kNN datastore AFTER scoring (score-first policy)
+                if use_knn and knn_store is not None and hidden_states is not None:
+                    seg_hidden = hidden_states[i, s:wlen]
+                    seg_targets = y_batch[i, s:wlen]
                     knn_store.add(seg_hidden.detach(), seg_targets)
 
                 loss_sum.add_(scored_nll.sum())
@@ -2233,14 +2285,20 @@ def main() -> None:
                         valid = p_ng > 0
                         expert_lp[valid, 1 + oi] = torch.log(p_ng[valid].clamp(min=1e-8))
                     # Expert last: kNN (if enabled and datastore has entries)
+                    # 1/4 sampling to keep kNN overhead ~22ms instead of ~86ms
                     if gate_knn_train is not None and gate_knn_train.size >= 32:
                         flat_hidden = hidden_g.reshape(-1, args.model_dim).detach()
-                        knn_result = gate_knn_train.query(flat_hidden, k=32, temperature=10.0)
+                        N_total = flat_hidden.shape[0]
+                        N_sample = N_total // 4
+                        sample_idx = torch.randperm(N_total, device=device)[:N_sample]
+                        knn_result = gate_knn_train.query(flat_hidden[sample_idx], k=32, temperature=10.0)
                         if knn_result is not None:
                             knn_probs, _ = knn_result
-                            knn_p_target = knn_probs.gather(1, flat_y.unsqueeze(1)).squeeze(1)
+                            sampled_y = flat_y[sample_idx]
+                            knn_p_target = knn_probs.gather(1, sampled_y.unsqueeze(1)).squeeze(1)
                             valid_knn = knn_p_target > 0
-                            expert_lp[valid_knn, -1] = torch.log(knn_p_target[valid_knn].clamp(min=1e-8))
+                            valid_global = sample_idx[valid_knn]
+                            expert_lp[valid_global, -1] = torch.log(knn_p_target[valid_knn].clamp(min=1e-8))
                     # Gate weights from hidden states
                     gate_weights = gate_head(hidden_g.reshape(-1, args.model_dim).detach())
                     # Gated log-prob: log(sum(w_i * exp(lp_i)))
@@ -2451,7 +2509,15 @@ def main() -> None:
         if isinstance(m, CastedLinear):
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
-    eval_model.load_state_dict(deq_state, strict=True)
+    # Separate gate_head weights from model weights before loading
+    gate_deq_keys = {k: v for k, v in deq_state.items() if k.startswith("gate_head.")}
+    model_deq_state = {k: v for k, v in deq_state.items() if not k.startswith("gate_head.")}
+    eval_model.load_state_dict(model_deq_state, strict=True)
+    # Restore gate_head from quantized checkpoint if available
+    if gate_deq_keys and gate_head is not None:
+        gate_deq_sd = {k.replace("gate_head.", ""): v for k, v in gate_deq_keys.items()}
+        gate_head.load_state_dict(gate_deq_sd)
+        log0(f"eval:restored gate_head from quantized checkpoint ({len(gate_deq_keys)} keys)")
 
     # TTT: adapt model on validation data before eval
     if args.ttt_enabled:
@@ -2498,7 +2564,7 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride,
             eval_seq_len=sw_seq_len,
-            eval_gate_head=gate_head,
+            eval_gate_head=gate_head, eval_gate_oracle=gate_oracle,
         )
         torch.cuda.synchronize()
         log0(
@@ -2516,7 +2582,7 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=64,
             eval_seq_len=sw_seq_len,
-            eval_gate_head=gate_head,
+            eval_gate_head=gate_head, eval_gate_oracle=gate_oracle,
         )
         torch.cuda.synchronize()
         log0(

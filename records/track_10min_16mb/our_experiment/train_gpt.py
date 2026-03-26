@@ -928,6 +928,7 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        self._last_hidden: Tensor | None = None  # cached for gate training
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -976,6 +977,7 @@ class GPT(nn.Module):
             x, _ = self.blocks[self.num_encoder_layers + i](x, x0, v0=v0)
 
         x = self.final_norm(x)
+        self._last_hidden = x.detach()  # cache for gate training (no second forward)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -1073,9 +1075,9 @@ class KNNDatastore:
         self.nlist = nlist
         self.nprobe = nprobe
         self.rebuild_every = rebuild_every
-        # CPU storage for FAISS
-        self.keys_cpu = np.zeros((max_tokens, dim), dtype=np.float32)
-        self.vals_cpu = np.zeros(max_tokens, dtype=np.int32)
+        # GPU-resident storage (avoid CPU-GPU transfers on add/query)
+        self.keys_gpu = torch.zeros(max_tokens, dim, dtype=torch.float32, device=device)
+        self.vals_gpu = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         self.size = 0
         self._last_index_size = 0
         self._index = None
@@ -1103,15 +1105,14 @@ class KNNDatastore:
             print("knn_datastore: FAISS not available, using exact search (SLOW)", flush=True)
 
     def add(self, hidden: Tensor, targets: Tensor) -> None:
-        """Add (hidden_state, target_token) pairs."""
+        """Add (hidden_state, target_token) pairs. Stays on GPU — no CPU sync."""
         n = hidden.shape[0]
         space = self.max_tokens - self.size
         if space <= 0:
             return
         actual = min(n, space)
-        h_np = F.normalize(hidden[:actual].float(), dim=-1).cpu().numpy()
-        self.keys_cpu[self.size:self.size + actual] = h_np
-        self.vals_cpu[self.size:self.size + actual] = targets[:actual].cpu().numpy().astype(np.int32)
+        self.keys_gpu[self.size:self.size + actual] = F.normalize(hidden[:actual].float(), dim=-1)
+        self.vals_gpu[self.size:self.size + actual] = targets[:actual].int()
         self.size += actual
 
     def _rebuild_index(self) -> None:
@@ -1123,7 +1124,7 @@ class KNNDatastore:
         quantizer = faiss.IndexFlatIP(self.dim)
         index_cpu = faiss.IndexIVFFlat(quantizer, self.dim, min(self.nlist, self.size // 2),
                                         faiss.METRIC_INNER_PRODUCT)
-        data = self.keys_cpu[:self.size]
+        data = self.keys_gpu[:self.size].cpu().numpy()  # CPU transfer only at rebuild
         index_cpu.train(data)
         index_cpu.add(data)
         if self._faiss_gpu:
@@ -1145,35 +1146,34 @@ class KNNDatastore:
                 self.size - self._last_index_size >= self.rebuild_every):
             self._rebuild_index()
 
-        q_np = F.normalize(queries.float(), dim=-1).cpu().numpy()
+        q_norm = F.normalize(queries.float(), dim=-1)
         Q = queries.shape[0]
         vocab_size = 1024
 
         if self._index is not None:
-            # FAISS GPU search (fast!)
-            sims, indices = self._index.search(q_np, k)  # (Q, k) each
-            sims = torch.from_numpy(sims).to(self.device)
-            indices = torch.from_numpy(indices.astype(np.int64)).to(self.device)
-            # Handle -1 indices (not enough results)
+            # FAISS search (needs CPU numpy for API)
+            q_np = q_norm.cpu().numpy()
+            sims_np, indices_np = self._index.search(q_np, k)  # (Q, k) each
+            sims = torch.from_numpy(sims_np).to(self.device)
+            indices = torch.from_numpy(indices_np.astype(np.int64)).to(self.device)
             valid_mask = indices >= 0
             indices = indices.clamp(min=0)
-            topk_tokens = torch.from_numpy(self.vals_cpu[indices.cpu().numpy()]).to(self.device)
+            topk_tokens = self.vals_gpu[indices]  # direct GPU indexing, no round-trip
         else:
-            # Exact brute-force fallback (slow, for small datastores or no FAISS)
-            k_data = torch.from_numpy(self.keys_cpu[:self.size]).to(self.device)
+            # Exact brute-force fallback on GPU (no CPU transfer)
+            k_data = self.keys_gpu[:self.size]
             batch = 512
             sims_list, idx_list = [], []
             for qi in range(0, Q, batch):
                 qe = min(qi + batch, Q)
-                q_batch = torch.from_numpy(q_np[qi:qe]).to(self.device)
-                sim = q_batch @ k_data.T
+                sim = q_norm[qi:qe] @ k_data.T
                 topk_sim, topk_idx = sim.topk(k, dim=-1)
                 sims_list.append(topk_sim)
                 idx_list.append(topk_idx)
             sims = torch.cat(sims_list, dim=0)
             indices = torch.cat(idx_list, dim=0)
             valid_mask = torch.ones_like(indices, dtype=torch.bool)
-            topk_tokens = torch.from_numpy(self.vals_cpu[indices.cpu().numpy()]).to(self.device)
+            topk_tokens = self.vals_gpu[indices]  # direct GPU indexing
 
         # Softmax-weighted probability from neighbors
         sims = sims.clamp(min=-1, max=1)
@@ -1259,6 +1259,35 @@ class GpuNgramMixer:
                 best_p[fill] = p
                 best_ord[fill] = self.min_order + oi
         return best_p, best_ord
+
+    def query_order(self, token_ids: Tensor, positions: Tensor, order_idx: int,
+                    min_count: int = 2) -> Tensor:
+        """Query a single n-gram order (no backoff). Returns probs (Q,), -1 = no match."""
+        token_ids = token_ids.long()
+        Q = positions.shape[0]
+        result = torch.full((Q,), -1.0, device=self.device)
+        oi = order_idx
+        ctx_w = self.min_order + oi - 1
+        valid = positions >= ctx_w
+        if not valid.any():
+            return result
+        v_idx = valid.nonzero(as_tuple=True)[0]
+        vpos = positions[v_idx]
+        ctx_hash = torch.zeros(len(vpos), dtype=torch.int64, device=self.device)
+        for k in range(ctx_w):
+            tok = token_ids[vpos - ctx_w + k].long()
+            ctx_hash ^= tok * self.primes[k % len(self.primes)]
+        ctx_key = (ctx_hash & self.mask).long()
+        tgt = token_ids[vpos].long()
+        full_key = ((ctx_hash ^ (tgt * self.primes[ctx_w % len(self.primes)])) & self.mask).long()
+        ctx_c = self.ctx_tables[oi][ctx_key].float()
+        full_c = self.full_tables[oi][full_key].float()
+        has_match = ctx_c >= min_count
+        if has_match.any():
+            matched = v_idx[has_match]
+            p = torch.clamp(full_c[has_match] / ctx_c[has_match].clamp(min=1), 0, 1)
+            result[matched] = p
+        return result
 
 
 class GateHead(nn.Module):
@@ -2187,7 +2216,13 @@ def main() -> None:
                 # Gate loss: route between neural + n-gram oracle + kNN
                 if use_gate and gate_head is not None and gate_oracle is not None:
                     with torch.no_grad():
-                        logits_g, hidden_g = base_model.forward_logits_with_hidden(x)
+                        hidden_g = base_model._last_hidden  # (B, T, dim) cached in forward()
+                        # Cheap logit projection instead of full second forward pass
+                        if base_model.tie_embeddings:
+                            logits_g = F.linear(hidden_g, base_model.tok_emb.weight)
+                        else:
+                            logits_g = base_model.lm_head(hidden_g)
+                        logits_g = base_model.logit_softcap * torch.tanh(logits_g / base_model.logit_softcap)
                         neural_lp = F.log_softmax(logits_g.float(), dim=-1)  # (B, T, V)
                     B, T, V = neural_lp.shape
                     flat_y = y.reshape(-1)  # (B*T,)
@@ -2195,10 +2230,12 @@ def main() -> None:
                     expert_lp = torch.full((B * T, n_exp), float("-inf"), device=device)
                     # Expert 0: neural
                     expert_lp[:, 0] = neural_lp.reshape(-1, V).gather(1, flat_y.unsqueeze(1)).squeeze(1)
-                    # Experts 1..n_orders: n-gram orders
+                    # Experts 1..n_orders: n-gram orders (each order queried separately)
+                    # Use per-sequence positions (0..T-1) to avoid cross-sequence n-gram leakage
                     flat_x = x.reshape(-1)
+                    positions = torch.arange(T, device=device).unsqueeze(0).expand(B, T).reshape(-1)
                     for oi in range(gate_n_orders):
-                        p_ng, _ = gate_oracle.query(flat_x, torch.arange(B * T, device=device), min_count=2)
+                        p_ng = gate_oracle.query_order(flat_x, positions, oi, min_count=2)
                         valid = p_ng > 0
                         expert_lp[valid, 1 + oi] = torch.log(p_ng[valid].clamp(min=1e-8))
                     # Expert last: kNN (if enabled and datastore has entries)

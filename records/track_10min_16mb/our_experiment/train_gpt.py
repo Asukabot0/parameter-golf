@@ -1957,10 +1957,14 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # When gate is enabled, _last_hidden assignment in forward() causes a graph break.
-    # Use fullgraph=False to allow this single break while keeping the rest compiled.
+    # When gate is enabled, skip torch.compile — _last_hidden in forward() is a side
+    # effect incompatible with fullgraph=True, and fullgraph=False causes recompilation.
+    # Eager single forward (~1200ms) beats compiled+uncompiled double forward (~4500ms).
     _gate_enabled = bool(int(os.environ.get("GATE_ENABLED", "0")))
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=not _gate_enabled)
+    if _gate_enabled:
+        compiled_model = base_model
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, static_graph=True) if distributed else compiled_model
 
     # Optimizer split:

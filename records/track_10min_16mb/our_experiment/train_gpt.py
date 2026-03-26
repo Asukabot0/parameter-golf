@@ -1957,7 +1957,14 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # Skip torch.compile when gate training is enabled — self._last_hidden side effect
+    # in forward() causes graph break with fullgraph=True. Eager single forward (~1100ms)
+    # is faster than compiled + uncompiled double forward (~2500ms+).
+    if bool(int(os.environ.get("GATE_ENABLED", "0"))):
+        compiled_model = base_model
+        log0("torch_compile:disabled (GATE_ENABLED=1, _last_hidden needs eager mode)")
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, static_graph=True) if distributed else compiled_model
 
     # Optimizer split:

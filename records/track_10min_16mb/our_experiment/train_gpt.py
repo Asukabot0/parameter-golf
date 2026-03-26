@@ -1112,6 +1112,102 @@ class KNNDatastore:
         return all_probs, all_dists
 
 
+class GpuNgramMixer:
+    """GPU-native n-gram backoff mixer using torch.scatter_add_."""
+
+    def __init__(self, n_orders: int, min_order: int, buckets: int, device: torch.device):
+        self.n_orders = n_orders
+        self.min_order = min_order
+        self.buckets = buckets
+        self.device = device
+        self.mask = buckets - 1  # power of 2
+        self.ctx_tables = [torch.zeros(buckets, dtype=torch.int32, device=device) for _ in range(n_orders)]
+        self.full_tables = [torch.zeros(buckets, dtype=torch.int32, device=device) for _ in range(n_orders)]
+        self.primes = torch.tensor(
+            [36313, 27191, 51647, 81929, 131071, 175447, 209591, 262147,
+             314159, 393241, 458753, 524309, 611957, 746773, 851969, 917503,
+             1048583, 1153433, 1258291, 1398269, 1523651, 1636007, 1741823,
+             1867559, 1987141, 2097169, 2228243, 2359297, 2490377],
+            dtype=torch.int64, device=device)
+
+    def update(self, token_ids: Tensor) -> None:
+        """Bulk update cache from a contiguous token sequence. token_ids: (N,) int."""
+        N = token_ids.shape[0]
+        for oi in range(self.n_orders):
+            ctx_w = self.min_order + oi - 1
+            if N <= ctx_w:
+                continue
+            pos = torch.arange(ctx_w, N, device=self.device)
+            ctx_hash = torch.zeros(len(pos), dtype=torch.int64, device=self.device)
+            for k in range(ctx_w):
+                tok = token_ids[pos - ctx_w + k].long()
+                ctx_hash ^= tok * self.primes[k % len(self.primes)]
+            ctx_key = ctx_hash & self.mask
+            tgt = token_ids[pos].long()
+            full_key = (ctx_hash ^ (tgt * self.primes[ctx_w % len(self.primes)])) & self.mask
+            ones = torch.ones(len(pos), dtype=torch.int32, device=self.device)
+            self.ctx_tables[oi].scatter_add_(0, ctx_key.long(), ones)
+            self.full_tables[oi].scatter_add_(0, full_key.long(), ones)
+
+    def query(self, token_ids: Tensor, positions: Tensor, min_count: int = 2
+              ) -> tuple[Tensor, Tensor]:
+        """Query n-gram probabilities with backoff.
+        token_ids: full val sequence (N,). positions: (Q,) positions to query.
+        Returns: (best_p_ng, best_order) shape (Q,). -1 means no match."""
+        Q = positions.shape[0]
+        best_p = torch.full((Q,), -1.0, device=self.device)
+        best_ord = torch.full((Q,), -1, dtype=torch.int32, device=self.device)
+        for oi in range(self.n_orders - 1, -1, -1):
+            ctx_w = self.min_order + oi - 1
+            valid = positions >= ctx_w
+            if not valid.any():
+                continue
+            v_idx = valid.nonzero(as_tuple=True)[0]
+            vpos = positions[v_idx]
+            ctx_hash = torch.zeros(len(vpos), dtype=torch.int64, device=self.device)
+            for k in range(ctx_w):
+                tok = token_ids[vpos - ctx_w + k].long()
+                ctx_hash ^= tok * self.primes[k % len(self.primes)]
+            ctx_key = (ctx_hash & self.mask).long()
+            tgt = token_ids[vpos].long()
+            full_key = ((ctx_hash ^ (tgt * self.primes[ctx_w % len(self.primes)])) & self.mask).long()
+            ctx_c = self.ctx_tables[oi][ctx_key].float()
+            full_c = self.full_tables[oi][full_key].float()
+            has_match = ctx_c >= min_count
+            needs_fill = has_match & (best_p[v_idx] < 0)
+            if needs_fill.any():
+                fill = v_idx[needs_fill]
+                p = torch.clamp(full_c[needs_fill] / ctx_c[needs_fill].clamp(min=1), 0, 1)
+                best_p[fill] = p
+                best_ord[fill] = self.min_order + oi
+        return best_p, best_ord
+
+
+class GateHead(nn.Module):
+    """Learned softmax gate over multiple experts (neural + n-gram orders + optional kNN)."""
+
+    def __init__(self, dim: int, n_experts: int, neural_floor: float = 0.05):
+        super().__init__()
+        self.gate = nn.Linear(dim, n_experts, bias=False)
+        self.neural_floor = neural_floor
+        self.n_experts = n_experts
+
+    def forward(self, hidden: Tensor, expert_mask: Tensor | None = None) -> Tensor:
+        """hidden: (..., dim). expert_mask: (..., n_experts) bool, True=valid.
+        Returns: (..., n_experts) softmax weights with neural_floor on expert 0."""
+        logits = self.gate(hidden)  # (..., n_experts)
+        if expert_mask is not None:
+            logits = logits.masked_fill(~expert_mask, float("-inf"))
+        weights = F.softmax(logits, dim=-1)
+        # Enforce minimum weight on neural expert (index 0)
+        if self.neural_floor > 0:
+            floor = self.neural_floor
+            neural_w = weights[..., 0:1].clamp(min=floor)
+            other_w = weights[..., 1:] * (1.0 - neural_w) / weights[..., 1:].sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            weights = torch.cat([neural_w, other_w], dim=-1)
+        return weights
+
+
 # -----------------------------
 # SLIDING WINDOW EVALUATION
 # -----------------------------
@@ -1803,9 +1899,37 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    # --- Learned Gate + Frozen N-gram Oracle (PR #834 inspired) ---
+    use_gate = bool(int(os.environ.get("GATE_ENABLED", "0")))
+    gate_n_orders = int(os.environ.get("GATE_ORDERS", "6"))  # orders 2-7
+    gate_min_order = 2
+    gate_buckets = int(os.environ.get("GATE_BUCKETS", "1048576"))  # 1M buckets
+    gate_head: GateHead | None = None
+    gate_oracle: GpuNgramMixer | None = None
+    if use_gate:
+        n_experts = 1 + gate_n_orders  # neural + n-gram orders
+        gate_head = GateHead(args.model_dim, n_experts, neural_floor=0.05).to(device)
+        gate_oracle = GpuNgramMixer(gate_n_orders, gate_min_order, gate_buckets, device)
+        # Pre-fill oracle from training shards
+        log0(f"gate:enabled n_experts={n_experts} orders={gate_min_order}-{gate_min_order+gate_n_orders-1} buckets={gate_buckets}")
+        import glob as _glob
+        _t0 = time.perf_counter()
+        for shard_path in sorted(_glob.glob(os.path.join(args.data_path, "fineweb_train_*.bin"))):
+            shard_tokens = load_data_shard(Path(shard_path)).to(device)
+            gate_oracle.update(shard_tokens)
+        log0(f"gate_oracle:prefilled {len(sorted(_glob.glob(os.path.join(args.data_path, 'fineweb_train_*.bin'))))} shards "
+             f"in {time.perf_counter()-_t0:.1f}s")
+        # Add gate params to optimizer
+        optimizer_gate = torch.optim.AdamW(
+            [{"params": gate_head.parameters(), "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+        )
+        optimizers.append(optimizer_gate)
+
     n_params = sum(p.numel() for p in base_model.parameters())
+    gate_params_count = sum(p.numel() for p in gate_head.parameters()) if gate_head else 0
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
-    log0(f"model_params:{n_params}")
+    log0(f"model_params:{n_params} gate_params:{gate_params_count}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"sdp_backends:fa3={_USE_FA3} cudnn=False flash=True mem_efficient={not _USE_FA3} math={not _USE_FA3}")
@@ -1951,6 +2075,27 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+                # Gate loss: route between neural model and frozen n-gram oracle
+                if use_gate and gate_head is not None and gate_oracle is not None:
+                    with torch.no_grad():
+                        logits_g, hidden_g = base_model.forward_logits_with_hidden(x)
+                        neural_lp = F.log_softmax(logits_g.float(), dim=-1)  # (B, T, V)
+                    # N-gram expert probabilities for each order
+                    B, T, V = neural_lp.shape
+                    flat_y = y.reshape(-1)  # (B*T,)
+                    # Build expert log-probs: (B*T, n_experts)
+                    expert_lp = torch.zeros(B * T, 1 + gate_n_orders, device=device)
+                    expert_lp[:, 0] = neural_lp.reshape(-1, V).gather(1, flat_y.unsqueeze(1)).squeeze(1)
+                    flat_x = x.reshape(-1)
+                    for oi in range(gate_n_orders):
+                        p_ng, _ = gate_oracle.query(flat_x, torch.arange(B * T, device=device), min_count=2)
+                        expert_lp[:, 1 + oi] = torch.log(p_ng.clamp(min=1e-8))
+                    # Gate weights from hidden states
+                    gate_weights = gate_head(hidden_g.reshape(-1, args.model_dim).detach())  # (B*T, n_exp)
+                    # Gated log-prob: log(sum(w_i * exp(lp_i)))
+                    gated_lp = torch.logsumexp(torch.log(gate_weights.clamp(min=1e-8)) + expert_lp, dim=-1)
+                    gate_loss = -gated_lp.mean()
+                    loss = loss + 0.1 * gate_loss  # auxiliary gate loss
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps

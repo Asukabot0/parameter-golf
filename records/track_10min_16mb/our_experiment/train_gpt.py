@@ -1246,6 +1246,7 @@ def eval_val_sliding(
     stride: int,
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
+    eval_gate_head: GateHead | None = None,
 ) -> tuple[float, float]:
     """Sliding window evaluation: each token scored with maximum context.
     Optionally uses entropy-gated 5-gram cache (NGRAM_CACHE=1)."""
@@ -1413,7 +1414,22 @@ def eval_val_sliding(
                     # Mix model probability with n-gram
                     has_match = best_p_ng >= 0
                     if has_match.any():
-                        if ngram_entropy:
+                        if eval_gate_head is not None and hidden_states is not None:
+                            # Learned gate routing (PR #834 style)
+                            seg_hidden = hidden_states[i, s:wlen]  # (seg_len, dim)
+                            with torch.no_grad():
+                                gate_w = eval_gate_head(seg_hidden)  # (seg_len, n_experts)
+                            gw_np = gate_w.cpu().numpy().astype(np.float64)
+                            # Expert 0 = neural, experts 1+ = n-gram orders
+                            neural_w = gw_np[has_match, 0]
+                            # Use best matching order's weight
+                            order_indices = best_order[has_match] - ngram_min_order + 1  # map to expert idx
+                            order_indices = np.clip(order_indices, 0, gw_np.shape[1] - 1)
+                            ngram_w = np.array([gw_np[j, oidx] for j, oidx in zip(np.where(has_match)[0], order_indices)])
+                            # Normalize to sum to 1
+                            total_w = neural_w + ngram_w
+                            alpha = ngram_w / np.maximum(total_w, 1e-8)
+                        elif ngram_entropy:
                             if ngram_per_order_ent:
                                 matched_centers = np.array([per_order_centers.get(o, ngram_ent_thresh) for o in best_order[has_match]])
                                 alpha = ngram_ent_base + ngram_ent_range / (
@@ -2016,7 +2032,15 @@ def main() -> None:
     eval_only_path = os.environ.get("EVAL_ONLY", "")
     if eval_only_path:
         log0(f"eval_only: loading {eval_only_path}, skipping training")
-        base_model.load_state_dict(torch.load(eval_only_path, map_location=device, weights_only=False), strict=False)
+        ckpt = torch.load(eval_only_path, map_location=device, weights_only=False)
+        # Separate gate_head weights from model weights
+        gate_keys = {k: v for k, v in ckpt.items() if k.startswith("gate_head.")}
+        model_keys = {k: v for k, v in ckpt.items() if not k.startswith("gate_head.")}
+        base_model.load_state_dict(model_keys, strict=False)
+        if gate_keys and gate_head is not None:
+            gate_sd = {k.replace("gate_head.", ""): v for k, v in gate_keys.items()}
+            gate_head.load_state_dict(gate_sd)
+            log0(f"eval_only: loaded gate_head ({len(gate_keys)} tensors)")
         ema_state = None  # prevent random EMA from overwriting loaded weights
         swa_state = None
         swa_count = 0
@@ -2181,6 +2205,11 @@ def main() -> None:
 
     full_state_dict = base_model.state_dict()
     export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
+    # Include gate_head weights in export if trained
+    if use_gate and gate_head is not None:
+        for k, v in gate_head.state_dict().items():
+            export_sd[f"gate_head.{k}"] = v
+        log0(f"export_gate_head: {sum(v.numel() for v in gate_head.state_dict().values())} params")
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
     if excluded_mtp > 0:
         log0(f"export_excluding_mtp_params:{excluded_mtp}")
@@ -2335,6 +2364,7 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride,
             eval_seq_len=sw_seq_len,
+            eval_gate_head=gate_head,
         )
         torch.cuda.synchronize()
         log0(
@@ -2352,6 +2382,7 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=64,
             eval_seq_len=sw_seq_len,
+            eval_gate_head=gate_head,
         )
         torch.cuda.synchronize()
         log0(

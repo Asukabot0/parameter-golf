@@ -1114,8 +1114,8 @@ class KNNDatastore:
         self.size += actual
 
     def _rebuild_index(self) -> None:
-        """Rebuild FAISS GPU index from current data."""
-        if self._faiss is None or self.size < self.nlist * 2:
+        """Rebuild FAISS GPU index from current data. Skip if no GPU FAISS (exact GPU search is faster)."""
+        if not self._faiss_gpu or self._faiss is None or self.size < self.nlist * 2:
             return
         faiss = self._faiss
         # Build IVF-Flat on CPU then move to GPU

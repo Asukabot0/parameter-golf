@@ -1032,6 +1032,85 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
+    def forward_logits_with_hidden(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
+        """Return (logits, hidden_states) where hidden_states is pre-projection."""
+        x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = self.smear(x)
+        x0 = x
+        v0 = None
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x, raw_v = self.blocks[i](x, x0, v0=v0)
+            if v0 is None and raw_v is not None:
+                v0 = raw_v
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x, _ = self.blocks[self.num_encoder_layers + i](x, x0, v0=v0)
+        x = self.final_norm(x)
+        hidden = x  # (bsz, seq_len, dim) — pre-projection hidden states
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return logits, hidden
+
+
+class KNNDatastore:
+    """GPU-resident kNN datastore for hidden state similarity search."""
+
+    def __init__(self, dim: int, max_tokens: int, device: torch.device):
+        self.keys = torch.zeros(max_tokens, dim, dtype=torch.float16, device=device)
+        self.vals = torch.zeros(max_tokens, dtype=torch.int32, device=device)
+        self.size = 0
+        self.dim = dim
+
+    def add(self, hidden: Tensor, targets: Tensor) -> None:
+        """Add (hidden_state, target_token) pairs. hidden: (N, dim), targets: (N,)."""
+        n = hidden.shape[0]
+        space = self.keys.shape[0] - self.size
+        if space <= 0:
+            return
+        actual = min(n, space)
+        self.keys[self.size:self.size + actual] = hidden[:actual].half()
+        self.vals[self.size:self.size + actual] = targets[:actual].int()
+        self.size += actual
+
+    def query(self, queries: Tensor, k: int = 32, temperature: float = 10.0
+              ) -> tuple[Tensor, Tensor] | None:
+        """Query k nearest neighbors. Returns (knn_probs, knn_dists) or None.
+        knn_probs: (Q, vocab) probability distribution from neighbors.
+        knn_dists: (Q,) mean distance to top-k neighbors."""
+        if self.size < k:
+            return None
+        # Normalize for cosine similarity
+        q_norm = F.normalize(queries.float(), dim=-1)          # (Q, dim)
+        k_norm = F.normalize(self.keys[:self.size].float(), dim=-1)  # (S, dim)
+        # Batched matmul — process in chunks to limit memory
+        Q = queries.shape[0]
+        vocab_size = 1024  # hardcoded for this competition
+        all_probs = torch.zeros(Q, vocab_size, device=queries.device)
+        all_dists = torch.zeros(Q, device=queries.device)
+        batch = 256  # process 256 queries at a time
+        for qi in range(0, Q, batch):
+            qe = min(qi + batch, Q)
+            sim = q_norm[qi:qe] @ k_norm.T                    # (batch, S)
+            topk_sim, topk_idx = sim.topk(k, dim=-1)          # (batch, k)
+            topk_tokens = self.vals[topk_idx]                  # (batch, k)
+            # Softmax-weighted probability from neighbors
+            weights = F.softmax(topk_sim * temperature, dim=-1)  # (batch, k)
+            # Scatter into vocab distribution
+            probs = torch.zeros(qe - qi, vocab_size, device=queries.device)
+            probs.scatter_add_(1, topk_tokens.long(), weights)
+            all_probs[qi:qe] = probs
+            all_dists[qi:qe] = topk_sim.mean(dim=-1)
+        return all_probs, all_dists
+
 
 # -----------------------------
 # SLIDING WINDOW EVALUATION
@@ -1101,6 +1180,17 @@ def eval_val_sliding(
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", "4.0"))
     ngram_per_order_ent = bool(int(os.environ.get("NGRAM_PER_ORDER_ENT", "1")))
     ngram_chunk_size = int(os.environ.get("NGRAM_CHUNK_SIZE", "4000000"))
+    # kNN-LM complement: hidden state similarity search
+    use_knn = bool(int(os.environ.get("KNN_CACHE", "0")))
+    knn_k = int(os.environ.get("KNN_K", "32"))
+    knn_lambda = float(os.environ.get("KNN_LAMBDA", "0.3"))
+    knn_temp = float(os.environ.get("KNN_TEMP", "10.0"))
+    knn_max_tokens = int(os.environ.get("KNN_MAX_TOKENS", "4000000"))
+    knn_store: KNNDatastore | None = None
+    if use_knn:
+        knn_store = KNNDatastore(args.model_dim, knn_max_tokens, device)
+        print(f"knn_cache:enabled k={knn_k} lambda={knn_lambda} temp={knn_temp} "
+              f"max_tokens={knn_max_tokens}", flush=True)
     if use_ngram:
         val_np = val_tokens.cpu().numpy()
         _n_orders = ngram_order - ngram_min_order + 1
@@ -1120,6 +1210,10 @@ def eval_val_sliding(
               f"min_count={ngram_min_count} buckets={ngram_buckets}", flush=True)
 
     base_model.eval()
+    if use_knn:
+        compiled_logits_hidden = torch.compile(base_model.forward_logits_with_hidden, dynamic=False, fullgraph=True)
+    else:
+        compiled_logits_hidden = None
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
 
     # --- Inner scoring function (shared by both paths) ---
@@ -1140,7 +1234,11 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = compiled_logits(x_batch)
+                if use_knn and knn_store is not None:
+                    logits, hidden_states = compiled_logits_hidden(x_batch)
+                else:
+                    logits = compiled_logits(x_batch)
+                    hidden_states = None
 
             nll = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
@@ -1220,6 +1318,25 @@ def eval_val_sliding(
                         seg_model_p[has_match] = (1.0 - alpha) * seg_model_p[has_match] + alpha * best_p_ng[has_match]
                     seg_nll_np = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
                     scored_nll = torch.from_numpy(seg_nll_np).to(dtype=torch.float64, device=device)
+
+                # kNN-LM complement: query hidden state neighbors, blend probability
+                if use_knn and knn_store is not None and hidden_states is not None:
+                    seg_hidden = hidden_states[i, s:wlen]  # (seg_len, dim)
+                    seg_targets = y_batch[i, s:wlen]       # (seg_len,)
+                    knn_result = knn_store.query(seg_hidden, k=knn_k, temperature=knn_temp)
+                    if knn_result is not None:
+                        knn_probs, knn_dists = knn_result  # (seg_len, vocab), (seg_len,)
+                        # Extract kNN probability for true target token
+                        knn_p_target = knn_probs.gather(1, seg_targets.long().unsqueeze(1)).squeeze(1)  # (seg_len,)
+                        knn_p_np = knn_p_target.cpu().numpy().astype(np.float64)
+                        # Blend: p_final = (1-lambda)*p_current + lambda*p_knn
+                        current_p = np.exp(-scored_nll.cpu().numpy())
+                        blended = (1.0 - knn_lambda) * current_p + knn_lambda * knn_p_np
+                        scored_nll = torch.from_numpy(
+                            -np.log(np.clip(blended, 1e-12, 1.0))
+                        ).to(dtype=torch.float64, device=device)
+                    # Score-first: add to datastore AFTER scoring
+                    knn_store.add(seg_hidden.detach(), seg_targets)
 
                 loss_sum.add_(scored_nll.sum())
                 token_count.add_(float(seg_len))

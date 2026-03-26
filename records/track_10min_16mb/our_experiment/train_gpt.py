@@ -1922,12 +1922,19 @@ def main() -> None:
     gate_buckets = int(os.environ.get("GATE_BUCKETS", "1048576"))  # 1M buckets
     gate_head: GateHead | None = None
     gate_oracle: GpuNgramMixer | None = None
+    gate_knn_train: KNNDatastore | None = None
+    gate_knn_size = int(os.environ.get("GATE_KNN_SIZE", "50000"))
+    gate_knn_update_every = int(os.environ.get("GATE_KNN_UPDATE_EVERY", "10"))
     if use_gate:
-        n_experts = 1 + gate_n_orders  # neural + n-gram orders
+        use_gate_knn = bool(int(os.environ.get("GATE_KNN", "1")))
+        n_experts = 1 + gate_n_orders + (1 if use_gate_knn else 0)  # neural + n-gram + kNN
         gate_head = GateHead(args.model_dim, n_experts, neural_floor=0.05).to(device)
         gate_oracle = GpuNgramMixer(gate_n_orders, gate_min_order, gate_buckets, device)
+        if use_gate_knn:
+            gate_knn_train = KNNDatastore(args.model_dim, gate_knn_size, device)
         # Pre-fill oracle from training shards
-        log0(f"gate:enabled n_experts={n_experts} orders={gate_min_order}-{gate_min_order+gate_n_orders-1} buckets={gate_buckets}")
+        log0(f"gate:enabled n_experts={n_experts} orders={gate_min_order}-{gate_min_order+gate_n_orders-1} "
+             f"knn={use_gate_knn}(size={gate_knn_size}) buckets={gate_buckets}")
         import glob as _glob
         _t0 = time.perf_counter()
         for shard_path in sorted(_glob.glob(os.path.join(args.data_path, "fineweb_train_*.bin"))):
@@ -2099,27 +2106,45 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
-                # Gate loss: route between neural model and frozen n-gram oracle
+                # Gate loss: route between neural + n-gram oracle + kNN
                 if use_gate and gate_head is not None and gate_oracle is not None:
                     with torch.no_grad():
                         logits_g, hidden_g = base_model.forward_logits_with_hidden(x)
                         neural_lp = F.log_softmax(logits_g.float(), dim=-1)  # (B, T, V)
-                    # N-gram expert probabilities for each order
                     B, T, V = neural_lp.shape
                     flat_y = y.reshape(-1)  # (B*T,)
-                    # Build expert log-probs: (B*T, n_experts)
-                    expert_lp = torch.zeros(B * T, 1 + gate_n_orders, device=device)
+                    n_exp = gate_head.n_experts
+                    expert_lp = torch.full((B * T, n_exp), float("-inf"), device=device)
+                    # Expert 0: neural
                     expert_lp[:, 0] = neural_lp.reshape(-1, V).gather(1, flat_y.unsqueeze(1)).squeeze(1)
+                    # Experts 1..n_orders: n-gram orders
                     flat_x = x.reshape(-1)
                     for oi in range(gate_n_orders):
                         p_ng, _ = gate_oracle.query(flat_x, torch.arange(B * T, device=device), min_count=2)
-                        expert_lp[:, 1 + oi] = torch.log(p_ng.clamp(min=1e-8))
+                        valid = p_ng > 0
+                        expert_lp[valid, 1 + oi] = torch.log(p_ng[valid].clamp(min=1e-8))
+                    # Expert last: kNN (if enabled and datastore has entries)
+                    if gate_knn_train is not None and gate_knn_train.size >= 32:
+                        flat_hidden = hidden_g.reshape(-1, args.model_dim).detach()
+                        knn_result = gate_knn_train.query(flat_hidden, k=32, temperature=10.0)
+                        if knn_result is not None:
+                            knn_probs, _ = knn_result
+                            knn_p_target = knn_probs.gather(1, flat_y.unsqueeze(1)).squeeze(1)
+                            valid_knn = knn_p_target > 0
+                            expert_lp[valid_knn, -1] = torch.log(knn_p_target[valid_knn].clamp(min=1e-8))
                     # Gate weights from hidden states
-                    gate_weights = gate_head(hidden_g.reshape(-1, args.model_dim).detach())  # (B*T, n_exp)
+                    gate_weights = gate_head(hidden_g.reshape(-1, args.model_dim).detach())
                     # Gated log-prob: log(sum(w_i * exp(lp_i)))
                     gated_lp = torch.logsumexp(torch.log(gate_weights.clamp(min=1e-8)) + expert_lp, dim=-1)
                     gate_loss = -gated_lp.mean()
-                    loss = loss + 0.1 * gate_loss  # auxiliary gate loss
+                    loss = loss + 0.1 * gate_loss
+                    # Ring buffer: update kNN datastore every N steps
+                    if gate_knn_train is not None and step % gate_knn_update_every == 0:
+                        with torch.no_grad():
+                            # Sample last 64 tokens from each sequence
+                            sample_h = hidden_g[:, -64:, :].reshape(-1, args.model_dim)
+                            sample_t = y[:, -64:].reshape(-1)
+                            gate_knn_train.add(sample_h, sample_t)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
